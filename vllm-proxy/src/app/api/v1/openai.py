@@ -14,20 +14,15 @@ from fastapi.responses import (
 
 from app.api.helper.auth import verify_authorization_header
 from app.api.response.response import (
-    invalid_signing_algo,
     not_found,
     unexpect_error,
 )
 from app.cache.cache import cache
 from app.logger import log
-from app.quote.quote import (
-    ECDSA,
-    ED25519,
-    ecdsa_context,
-    ed25519_context,
-    generate_attestation,
-    sign_message,
-)
+from app.quote.quote import sign, generate_attestation
+from app.wallet.bsv_wallet import get_tee_public_key, INFERENCE_SIGNING_PROTOCOL
+from app.attestation.anchor import get_attestation_id
+from app.receipts.accumulator import add_receipt
 
 router = APIRouter(tags=["openai"])
 
@@ -41,22 +36,19 @@ TIMEOUT = 60 * 10
 COMMON_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
 
 
-def sign_request(request: dict, response: str):
-    content = json.dumps(request.get("messages", [])) + "\n" + response
-    return quote.sign(content)
-
-
 def hash(payload: str):
     return sha256(payload.encode()).hexdigest()
 
 
-def sign_chat(text: str):
+def sign_chat(text: str) -> dict:
+    """Sign inference text with BRC-100 and return cache entry."""
+    attestation_id = get_attestation_id()
     return dict(
         text=text,
-        signature_ecdsa=sign_message(ecdsa_context, text),
-        signing_address_ecdsa=ecdsa_context.signing_address,
-        signature_ed25519=sign_message(ed25519_context, text),
-        signing_address_ed25519=ed25519_context.signing_address,
+        signature=sign(text),
+        signing_identity_key=get_tee_public_key(),
+        protocolID=INFERENCE_SIGNING_PROTOCOL,
+        keyID=attestation_id,
     )
 
 
@@ -67,13 +59,11 @@ async def stream_vllm_response(
     request_hash: Optional[str] = None,
 ):
     """
-    Handle streaming vllm request
+    Handle streaming vllm request.
     Args:
         request_body: The original request body
         modified_request_body: The modified enhanced request body
-        request_hash: Optional hash from request header (X-Request-Hash). Used by trusted clients to provide
-                     pre-calculated request hash, avoiding redundant hash computation. Falls back to
-                     calculating hash from request_body if not provided
+        request_hash: Optional hash from request header (X-Request-Hash)
     Returns:
         A streaming response
     """
@@ -91,7 +81,6 @@ async def stream_vllm_response(
         nonlocal chat_id, h
         async for chunk in response.aiter_text():
             h.update(chunk.encode())
-            # Extract the cache key (data.id) from the first chunk
             if not chat_id:
                 data = chunk.strip("data: ").strip()
                 if not data or data == "[DONE]":
@@ -107,21 +96,19 @@ async def stream_vllm_response(
             yield chunk
 
         response_sha256 = h.hexdigest()
-        # Cache the full request and response using the extracted cache key
         if chat_id:
-            cache.set_chat(
-                chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
-            )
+            signed = sign_chat(f"{request_sha256}:{response_sha256}")
+            cache.set_chat(chat_id, json.dumps(signed))
+            add_receipt(request_sha256, response_sha256, chat_id)
         else:
             error_message = "Chat id could not be extracted from the response"
             log.error(error_message)
             raise Exception(error_message)
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT), headers=COMMON_HEADERS)
-    # Forward the request to the vllm backend
     req = client.build_request("POST", url, content=modified_request_body)
     response = await client.send(req, stream=True)
-    # If not 200, return the error response directly without streaming
+
     if response.status_code != 200:
         error_content = await response.aread()
         await response.aclose()
@@ -137,10 +124,13 @@ async def stream_vllm_response(
         generate_stream(response),
         background=BackgroundTasks([response.aclose, client.aclose]),
         media_type="text/event-stream",
+        headers={
+            "X-Signing-Identity-Key": get_tee_public_key(),
+            "X-Attestation-Txid": get_attestation_id(),
+        },
     )
 
 
-# Function to handle non-streaming responses
 async def non_stream_vllm_response(
     url: str,
     request_body: bytes,
@@ -148,13 +138,11 @@ async def non_stream_vllm_response(
     request_hash: Optional[str] = None,
 ):
     """
-    Handle non-streaming responses
+    Handle non-streaming responses.
     Args:
         request_body: The original request body
         modified_request_body: The modified enhanced request body
-        request_hash: Optional hash from request header (X-Request-Hash). Used by trusted clients to provide
-                     pre-calculated request hash, avoiding redundant hash computation. Falls back to
-                     calculating hash from request_body if not provided
+        request_hash: Optional hash from request header (X-Request-Hash)
     Returns:
         The response data
     """
@@ -173,13 +161,12 @@ async def non_stream_vllm_response(
             raise HTTPException(status_code=response.status_code, detail=response.text)
 
         response_data = response.json()
-        # Cache the request-response pair using the chat ID
         chat_id = response_data.get("id")
         if chat_id:
             response_sha256 = sha256(response.content).hexdigest()
-            cache.set_chat(
-                chat_id, json.dumps(sign_chat(f"{request_sha256}:{response_sha256}"))
-            )
+            signed = sign_chat(f"{request_sha256}:{response_sha256}")
+            cache.set_chat(chat_id, json.dumps(signed))
+            add_receipt(request_sha256, response_sha256, chat_id)
         else:
             raise Exception("Chat id could not be extracted from the response")
 
@@ -188,16 +175,14 @@ async def non_stream_vllm_response(
 
 def strip_empty_tool_calls(payload: dict) -> dict:
     """
-    Strip empty tool calls from the payload
-    To fix the bug of:
-    https://github.com/vllm-project/vllm/pull/14054
+    Strip empty tool calls from the payload.
+    Fix for: https://github.com/vllm-project/vllm/pull/14054
     """
     if "messages" not in payload:
         return payload
 
     filtered_messages = []
     for message in payload["messages"]:
-        # If the message has tool_calls, filter out empty ones
         if (
             "tool_calls" in message
             and isinstance(message["tool_calls"], list)
@@ -210,30 +195,26 @@ def strip_empty_tool_calls(payload: dict) -> dict:
     return payload
 
 
-# Get attestation report of intel quote and nvidia payload
+# Get attestation report
 @router.get("/attestation/report", dependencies=[Depends(verify_authorization_header)])
 async def attestation_report(
     request: Request,
-    signing_algo: str | None = None,
     nonce: str | None = Query(None),
-    signing_address: str | None = Query(None),
+    signing_identity_key: str | None = Query(None),
 ):
-    signing_algo = ECDSA if signing_algo is None else signing_algo
-    if signing_algo not in [ECDSA, ED25519]:
-        return invalid_signing_algo()
+    tee_pubkey = get_tee_public_key()
 
-    context = ecdsa_context if signing_algo == ECDSA else ed25519_context
+    # If signing_identity_key is specified and doesn't match, return 404
+    if signing_identity_key and tee_pubkey.lower() != signing_identity_key.lower():
+        raise HTTPException(status_code=404, detail="Signing identity key not found on this server")
 
-    # If signing_address is specified and doesn't match this server's address, return 404
-    if signing_address and context.signing_address.lower() != signing_address.lower():
-        raise HTTPException(status_code=404, detail="Signing address not found on this server")
     try:
-        attestation = generate_attestation(context, nonce)
+        report = generate_attestation(nonce)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    resp = dict(attestation)
-    resp["all_attestations"] = [attestation]
+    resp = dict(report)
+    resp["all_attestations"] = [report]
     return resp
 
 
@@ -243,28 +224,28 @@ async def chat_completions(
     request: Request,
     x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
 ):
-    # Keep original request body to calculate the request hash for attestation
     request_body = await request.body()
     request_json = json.loads(request_body)
     modified_json = strip_empty_tool_calls(request_json)
 
-    # Check if the request is for streaming or non-streaming
-    is_stream = modified_json.get(
-        "stream", False
-    )  # Default to non-streaming if not specified
+    is_stream = modified_json.get("stream", False)
 
     modified_request_body = json.dumps(modified_json).encode("utf-8")
     if is_stream:
-        # Create a streaming response
         return await stream_vllm_response(
             VLLM_URL, request_body, modified_request_body, x_request_hash
         )
     else:
-        # Handle non-streaming response
         response_data = await non_stream_vllm_response(
             VLLM_URL, request_body, modified_request_body, x_request_hash
         )
-        return JSONResponse(content=response_data)
+        return JSONResponse(
+            content=response_data,
+            headers={
+                "X-Signing-Identity-Key": get_tee_public_key(),
+                "X-Attestation-Txid": get_attestation_id(),
+            },
+        )
 
 
 # VLLM completions
@@ -273,62 +254,49 @@ async def completions(
     request: Request,
     x_request_hash: Optional[str] = Header(None, alias="X-Request-Hash"),
 ):
-    # Keep original request body to calculate the request hash for attestation
     request_body = await request.body()
     request_json = json.loads(request_body)
     modified_json = strip_empty_tool_calls(request_json)
 
-    # Check if the request is for streaming or non-streaming
-    is_stream = modified_json.get(
-        "stream", False
-    )  # Default to non-streaming if not specified
+    is_stream = modified_json.get("stream", False)
 
     modified_request_body = json.dumps(modified_json).encode("utf-8")
     if is_stream:
-        # Create a streaming response
         return await stream_vllm_response(
             VLLM_COMPLETIONS_URL, request_body, modified_request_body, x_request_hash
         )
     else:
-        # Handle non-streaming response
         response_data = await non_stream_vllm_response(
             VLLM_COMPLETIONS_URL, request_body, modified_request_body, x_request_hash
         )
-        return JSONResponse(content=response_data)
+        return JSONResponse(
+            content=response_data,
+            headers={
+                "X-Signing-Identity-Key": get_tee_public_key(),
+                "X-Attestation-Txid": get_attestation_id(),
+            },
+        )
 
 
-# Get signature for chat_id of chat history
+# Get signature for chat_id
 @router.get("/signature/{chat_id}", dependencies=[Depends(verify_authorization_header)])
-async def signature(request: Request, chat_id: str, signing_algo: str = None):
+async def signature(request: Request, chat_id: str):
     cache_value = cache.get_chat(chat_id)
     if cache_value is None:
         return not_found("Chat id not found or expired")
 
-    signature = None
-    signing_algo = ECDSA if signing_algo is None else signing_algo
-
-    # Retrieve the cached request and response
     try:
         value = json.loads(cache_value)
     except Exception as e:
         log.error(f"Failed to parse the cache value: {cache_value} {e}")
         return unexpect_error("Failed to parse the cache value", e)
 
-    signing_address = None
-    if signing_algo == ECDSA:
-        signature = value.get("signature_ecdsa")
-        signing_address = value.get("signing_address_ecdsa")
-    elif signing_algo == ED25519:
-        signature = value.get("signature_ed25519")
-        signing_address = value.get("signing_address_ed25519")
-    else:
-        return invalid_signing_algo()
-
     return dict(
         text=value.get("text"),
-        signature=signature,
-        signing_address=signing_address,
-        signing_algo=signing_algo,
+        signature=value.get("signature"),
+        signing_identity_key=value.get("signing_identity_key"),
+        protocolID=value.get("protocolID"),
+        keyID=value.get("keyID"),
     )
 
 

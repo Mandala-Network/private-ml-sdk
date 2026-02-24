@@ -8,7 +8,7 @@ WORKDIR /tmp
 # because of nv-ppcie-verifier requires some old version packages,
 # which is not compatible with lots of current dependencies.
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --upgrade -r requirements.txt \
+RUN pip install --no-cache-dir --upgrade --pre -r requirements.txt \
     && rm -rf requirements.txt
 
 # Copy source code
