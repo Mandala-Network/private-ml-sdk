@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
     if callback_url:
         try:
             from bsv.keys import PublicKey
-            address = PublicKey.from_hex(tee_pubkey).to_address()
+            address = PublicKey(tee_pubkey).address()
             sync_requests.post(
                 f"{callback_url.rstrip('/')}/fund-proxy",
                 json={"address": address, "publicKey": tee_pubkey, "amount": 1000},
